@@ -15,98 +15,71 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import f1_score
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split
+
+
+TAILS = (3, 8, 16)
+BLOCK_DIM = 5 * 896  # num_layers * hidden_dim
 
 
 class HallucinationProbe(nn.Module):
-    """Binary classifier that detects hallucinations from hidden-state features.
-
-    Extends ``torch.nn.Module``; the default architecture is a single
-    hidden-layer MLP with ``StandardScaler`` pre-processing.  The network is
-    built lazily in ``fit()`` once the feature dimension is known.
-    """
+    """Binary classifier that detects hallucinations from hidden-state features."""
 
     def __init__(self) -> None:
         super().__init__()
-        self._net: nn.Sequential | None = None  # built lazily in fit()
-        self._scaler = StandardScaler()
+        # per-block (StandardScaler + PCA) for each tail
+        self._scalers: dict[int, StandardScaler] = {k: StandardScaler() for k in TAILS}
+        self._pcas: dict[int, PCA] = {
+            k: PCA(n_components=24, whiten=True, random_state=0) for k in TAILS
+        }
+
+        self._clf: LogisticRegression | None = None
         self._threshold: float = 0.5  # tuned by fit_hyperparameters()
 
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the network definition below.
-    # ------------------------------------------------------------------
-    def _build_network(self, input_dim: int) -> None:
-        """Instantiate the network layers.
+    def _preprocess(self, X: np.ndarray, fit: bool = False) -> np.ndarray:
+        last = X[:, :BLOCK_DIM]
 
-        Called once at the start of ``fit()`` when ``input_dim`` is known.
+        blocks = []
+        for i, k in enumerate(TAILS):
+            offset = (1 + i) * BLOCK_DIM
+            tail = X[:, offset : offset + BLOCK_DIM]
+            view = np.concatenate([last, tail], axis=1)
 
-        Args:
-            input_dim: Feature vector dimensionality.
-        """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
+            scaler, pca = self._scalers[k], self._pcas[k]
+            X_scaled = scaler.fit_transform(view) if fit else scaler.transform(view)
+            X_reduced = pca.fit_transform(X_scaled) if fit else pca.transform(X_scaled)
 
-    # ------------------------------------------------------------------
+            blocks.append(X_reduced)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass — returns raw logits of shape ``(n_samples,)``.
-
-        Args:
-            x: Float tensor of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            1-D tensor of raw (pre-sigmoid) logits.
-        """
-        if self._net is None:
-            raise RuntimeError(
-                "Network has not been built yet. Call fit() before forward()."
-            )
-        return self._net(x).squeeze(-1)
+        return np.concatenate(blocks, axis=1)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
         """Train the probe on labelled feature vectors.
 
-        Scales features with ``StandardScaler``, builds the network if needed,
-        and optimises with Adam + ``BCEWithLogitsLoss``.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-            y: Integer label vector of shape ``(n_samples,)``; 0 = truthful,
-               1 = hallucinated.
-
         Returns:
             ``self`` (for method chaining).
         """
-        X_scaled = self._scaler.fit_transform(X)
+        X_inner_train, X_inner_val, y_inner_train, y_inner_val = train_test_split(
+            X, y, test_size=0.2, stratify=y, random_state=0
+        )
 
-        self._build_network(X_scaled.shape[1])
+        X_processed = self._preprocess(X_inner_train, fit=True)
+        self._clf = LogisticRegression(
+            C=0.05, max_iter=4000, class_weight="balanced", solver="liblinear"
+        )
+        self._clf.fit(X_processed, y_inner_train)
+        self.fit_hyperparameters(X_inner_val, y_inner_val)
 
-        X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
+        # refit on full training data so we don't waste the inner-val rows
+        Xp_full = self._preprocess(X, fit=True)
+        self._clf = LogisticRegression(
+            C=0.05, max_iter=4000, class_weight="balanced", solver="liblinear"
+        )
+        self._clf.fit(Xp_full, y)
 
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the training loop below.
-        # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-
-        self.train()
-        for _ in range(200):
-            optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
-            loss.backward()
-            optimizer.step()
-        # ------------------------------------------------------------------
-
-        self.eval()
         return self
 
     def fit_hyperparameters(
@@ -169,10 +142,5 @@ class HallucinationProbe(nn.Module):
             estimated probability of the hallucinated class (label 1).
             Used to compute AUROC.
         """
-        X_scaled = self._scaler.transform(X)
-        X_t = torch.from_numpy(X_scaled).float()
-        with torch.no_grad():
-            logits = self(X_t)
-            prob_pos = torch.sigmoid(logits).numpy()
-        return np.stack([1.0 - prob_pos, prob_pos], axis=1)
-
+        X_processed = self._preprocess(X, fit=False)
+        return self._clf.predict_proba(X_processed)

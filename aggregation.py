@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import torch
 
+LAYERS = (12, 13, 14, 15, 16)
+TAILS = (3, 8, 16)
+
 
 def aggregate(
     hidden_states: torch.Tensor,
@@ -45,16 +48,23 @@ def aggregate(
     # STUDENT: Replace or extend the aggregation below.
     # ------------------------------------------------------------------
 
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
-
     # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
+    real_positions = attention_mask.nonzero(as_tuple=False).squeeze(-1)  # (n_real,)
+    last_pos = int(real_positions[-1].item())
 
-    feature = layer[last_pos]          # (hidden_dim,)
+    last_token_features = [
+        hidden_states[layer, last_pos, :].float() for layer in LAYERS
+    ]
 
-    return feature
+    # adding mean of last k tokens
+    tail_mean_features = []
+    for k in TAILS:
+        tail_idx = real_positions[-min(k, real_positions.numel()) :]
+        tail_mean_features += [
+            hidden_states[layer, tail_idx, :].float().mean(dim=0) for layer in LAYERS
+        ]
+
+    return torch.cat(last_token_features + tail_mean_features, dim=0)
     # ------------------------------------------------------------------
 
 
